@@ -23,6 +23,7 @@ jobs:
     timeout-minutes: 10
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      SUPPRESS_LABEL_WARNING: "True"
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -55,8 +56,9 @@ jobs:
         env:
           C: ${{ secrets.OCI_TENANCY }}
           SUBNET_ID: ${{ secrets.SUBNET_ID }}
+        shell: bash
         run: |
-          set -uo pipefail
+          set +e
 
           # 1) Server pehle se bana hai? To workflow band kar do.
           existing=$(oci compute instance list -c "$C" --all 2>/dev/null \
@@ -90,16 +92,16 @@ jobs:
                     --subnet-id "$SUBNET_ID" \
                     --assign-public-ip true \
                     --boot-volume-size-in-gbs 150 \
-                    --ssh-authorized-keys-file ~/.oci/ssh.pub 2>&1)
+                    --ssh-authorized-keys-file ~/.oci/ssh.pub 2>&1) || true
 
-            if echo "$out" | grep -q '"lifecycle-state"'; then
+            if grep -q '"lifecycle-state"' <<< "$out"; then
               echo "SUCCESS: server created with $1 OCPU / $2 GB"
               gh issue create \
                 --title "✅ Oracle server ban gaya! ($1 OCPU / $2 GB)" \
                 --body "hermes-server create ho gaya. Oracle console > Compute > Instances mein Public IP dekh lo. Ye workflow ab apne aap band ho gaya hai." || true
               gh workflow disable oracle-retry.yml || true
               exit 0
-            elif echo "$out" | grep -qiE "capacity|TooManyRequests"; then
+            elif grep -qiE "capacity|TooManyRequests" <<< "$out"; then
               echo "No capacity for $1/$2 (or rate limited). Next..."
               sleep 5
             else
