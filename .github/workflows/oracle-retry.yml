@@ -1,0 +1,112 @@
+name: oracle-retry
+
+# Har 5 minute mein Oracle pe hermes-server banane ki koshish karta hai.
+# Server ban jaye to GitHub Issue banata hai (tujhe email aayega) aur khud ko band kar deta hai.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  actions: write
+
+concurrency:
+  group: oracle-retry
+  cancel-in-progress: false
+
+jobs:
+  launch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Install OCI CLI
+        run: pip install --quiet oci-cli
+
+      - name: Configure OCI
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUB_KEY: ${{ secrets.SSH_PUB_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          printf '%s\n' "$SSH_PUB_KEY" > ~/.oci/ssh.pub
+          cat > ~/.oci/config <<EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=$HOME/.oci/key.pem
+          EOF
+          chmod 600 ~/.oci/key.pem ~/.oci/config
+
+      - name: Try to create server
+        env:
+          C: ${{ secrets.OCI_TENANCY }}
+          SUBNET_ID: ${{ secrets.SUBNET_ID }}
+        run: |
+          set -uo pipefail
+
+          # 1) Server pehle se bana hai? To workflow band kar do.
+          existing=$(oci compute instance list -c "$C" --all 2>/dev/null \
+            | jq '[.data[]? | select(.["display-name"]=="hermes-server" and .["lifecycle-state"]!="TERMINATED")] | length')
+          if [ "${existing:-0}" -gt 0 ]; then
+            echo "Server already exists. Disabling workflow."
+            gh workflow disable oracle-retry.yml || true
+            exit 0
+          fi
+
+          # 2) Availability domain aur Ubuntu 24.04 (ARM) image dhoondo
+          AD=$(oci iam availability-domain list -c "$C" | jq -r '.data[0].name')
+          IMG=$(oci compute image list -c "$C" \
+                  --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+                  --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --all \
+                | jq -r '[.data[] | select(.["display-name"] | test("Minimal") | not)][0].id')
+          echo "AD=$AD"
+          echo "IMG=$IMG"
+          if [ -z "$IMG" ] || [ "$IMG" = "null" ]; then echo "Image not found"; exit 1; fi
+
+          # 3) Bade se chhote size tak try karo
+          for cfg in "4 24" "2 12" "1 6"; do
+            set -- $cfg
+            echo "Trying $1 OCPU / $2 GB ..."
+            out=$(oci compute instance launch -c "$C" \
+                    --availability-domain "$AD" \
+                    --display-name hermes-server \
+                    --shape VM.Standard.A1.Flex \
+                    --shape-config "{\"ocpus\": $1, \"memoryInGBs\": $2}" \
+                    --image-id "$IMG" \
+                    --subnet-id "$SUBNET_ID" \
+                    --assign-public-ip true \
+                    --boot-volume-size-in-gbs 150 \
+                    --ssh-authorized-keys-file ~/.oci/ssh.pub 2>&1)
+
+            if echo "$out" | grep -q '"lifecycle-state"'; then
+              echo "SUCCESS: server created with $1 OCPU / $2 GB"
+              gh issue create \
+                --title "✅ Oracle server ban gaya! ($1 OCPU / $2 GB)" \
+                --body "hermes-server create ho gaya. Oracle console > Compute > Instances mein Public IP dekh lo. Ye workflow ab apne aap band ho gaya hai." || true
+              gh workflow disable oracle-retry.yml || true
+              exit 0
+            elif echo "$out" | grep -qiE "capacity|TooManyRequests"; then
+              echo "No capacity for $1/$2 (or rate limited). Next..."
+              sleep 5
+            else
+              echo "Unexpected error:"
+              echo "$out"
+              exit 1
+            fi
+          done
+
+          echo "Abhi capacity nahi mili. 5 minute baad phir try hoga."
